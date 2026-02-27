@@ -581,6 +581,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         streaming_encoding: bool = False,
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
+        wanted_features: list[str] | None = None,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -718,6 +719,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.episodes_since_last_encoding = 0
         self.vcodec = resolve_vcodec(vcodec)
         self._encoder_threads = encoder_threads
+        self.wanted_features = wanted_features
 
         # Unused attributes
         self.image_writer = None
@@ -1007,7 +1009,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         query_indices: dict[str, list[int]] | None = None,
     ) -> dict[str, list[float]]:
         query_timestamps = {}
-        for key in self.meta.video_keys:
+        if self.wanted_features is not None:
+            video_keys = [k for k in self.meta.video_keys if k in self.wanted_features]
+        else:
+            video_keys = self.meta.video_keys
+
+        for key in video_keys:
             if query_indices is not None and key in query_indices:
                 # Use preloaded timestamps when available (avoids hf_dataset access)
                 if hasattr(self, "_timestamps"):
@@ -1045,9 +1052,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
             Dict with stacked tensors of queried data (video keys excluded)
         """
         # Filter to non-video keys (video data comes from _query_videos)
-        filtered_indices = {
-            k: v for k, v in query_indices.items() if k not in self.meta.video_keys
-        }
+        if self.wanted_features is not None:
+            filtered_indices = {
+                k: v for k, v in query_indices.items() if (k in self.wanted_features and k not in self.meta.video_keys)
+            }
+        else:
+            filtered_indices = {
+                k: v for k, v in query_indices.items() if k not in self.meta.video_keys
+            }
         if not filtered_indices:
             return {}
 
@@ -1161,14 +1173,22 @@ class LeRobotDataset(torch.utils.data.Dataset):
             for key, val in query_result.items():
                 item[key] = val
 
-        if len(self.meta.video_keys) > 0:
+        if self.wanted_features is not None:
+            video_keys = [k for k in self.meta.video_keys if k in self.wanted_features]
+        else:
+            video_keys = self.meta.video_keys
+
+        if len(video_keys) > 0:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
             item = {**video_frames, **item}
 
         if self.image_transforms is not None:
-            image_keys = self.meta.camera_keys
+            if self.wanted_features is not None:
+                image_keys = [k for k in self.meta.camera_keys if k in self.wanted_features]
+            else:
+                image_keys = self.meta.camera_keys
             for cam in image_keys:
                 item[cam] = self.image_transforms(item[cam])
 
