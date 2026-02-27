@@ -762,6 +762,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 for rel_idx, abs_idx in enumerate(self.hf_dataset["index"])
             }
 
+        # Preload timestamps for fast lookup (avoids repeated hf_dataset access in _get_query_timestamps)
+        self._timestamps = np.array(self.hf_dataset["timestamp"])
+
         # Setup delta_indices
         if self.delta_timestamps is not None:
             check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
@@ -1006,12 +1009,24 @@ class LeRobotDataset(torch.utils.data.Dataset):
         query_timestamps = {}
         for key in self.meta.video_keys:
             if query_indices is not None and key in query_indices:
-                if self._absolute_to_relative_idx is not None:
-                    relative_indices = [self._absolute_to_relative_idx[idx] for idx in query_indices[key]]
-                    timestamps = self.hf_dataset[relative_indices]["timestamp"]
+                # Use preloaded timestamps when available (avoids hf_dataset access)
+                if hasattr(self, "_timestamps"):
+                    if self._absolute_to_relative_idx is not None:
+                        relative_indices = [
+                            self._absolute_to_relative_idx[idx] for idx in query_indices[key]
+                        ]
+                    else:
+                        relative_indices = query_indices[key]
+                    query_timestamps[key] = self._timestamps[relative_indices].tolist()
                 else:
-                    timestamps = self.hf_dataset[query_indices[key]]["timestamp"]
-                query_timestamps[key] = torch.stack(timestamps).tolist()
+                    if self._absolute_to_relative_idx is not None:
+                        relative_indices = [
+                            self._absolute_to_relative_idx[idx] for idx in query_indices[key]
+                        ]
+                        timestamps = self.hf_dataset[relative_indices]["timestamp"]
+                    else:
+                        timestamps = self.hf_dataset[query_indices[key]]["timestamp"]
+                    query_timestamps[key] = torch.stack(timestamps).tolist()
             else:
                 query_timestamps[key] = [current_ts]
 
@@ -1021,7 +1036,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         """
         Query dataset for indices across keys, skipping video keys.
 
-        Tries column-first [key][indices] for speed, falls back to row-first.
+        Uses a single merged fetch instead of one per key for efficiency.
 
         Args:
             query_indices: Dict mapping keys to index lists to retrieve
@@ -1029,20 +1044,39 @@ class LeRobotDataset(torch.utils.data.Dataset):
         Returns:
             Dict with stacked tensors of queried data (video keys excluded)
         """
-        result: dict = {}
-        for key, q_idx in query_indices.items():
-            if key in self.meta.video_keys:
-                continue
-            # Map absolute indices to relative indices if needed
-            relative_indices = (
-                q_idx
-                if self._absolute_to_relative_idx is None
-                else [self._absolute_to_relative_idx[idx] for idx in q_idx]
+        # Filter to non-video keys (video data comes from _query_videos)
+        filtered_indices = {
+            k: v for k, v in query_indices.items() if k not in self.meta.video_keys
+        }
+        if not filtered_indices:
+            return {}
+
+        # Map to relative indices if needed
+        def to_relative(indices: list[int]) -> list[int]:
+            if self._absolute_to_relative_idx is None:
+                return indices
+            return [self._absolute_to_relative_idx[idx] for idx in indices]
+
+        # Single merged fetch: collect all unique relative indices
+        all_relative = sorted(
+            set(
+                rel_idx
+                for indices in filtered_indices.values()
+                for rel_idx in to_relative(indices)
             )
-            try:
-                result[key] = torch.stack(self.hf_dataset[key][relative_indices])
-            except (KeyError, TypeError, IndexError):
-                result[key] = torch.stack(self.hf_dataset[relative_indices][key])
+        )
+        subset = self.hf_dataset[all_relative]
+        rel_to_pos = {rel: i for i, rel in enumerate(all_relative)}
+
+        # subset is a dict of columns when indexed with a list (not row-indexable)
+        result: dict = {}
+        for key, indices in filtered_indices.items():
+            relative_indices = to_relative(indices)
+            col = subset[key]
+            values = [col[rel_to_pos[rel]] for rel in relative_indices]
+            result[key] = torch.stack(
+                [v if isinstance(v, torch.Tensor) else torch.tensor(v) for v in values]
+            )
         return result
 
     def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict[str, torch.Tensor]:
@@ -1066,6 +1100,36 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         return item
 
+    def _ensure_shape1_as_list(self, item: dict) -> dict:
+        """Convert scalar values to tensor of shape (1,) or (T,1) for features with shape [1].
+
+        Parquet may store shape-[1] columns as scalars. Downstream code expects
+        list/array shape, so we wrap scalars as [value] on load.
+        """
+        for key, ft in self.features.items():
+            shape = ft.get("shape")
+            if shape is None or (shape != [1] and shape != (1,)):
+                continue
+            if key not in item:
+                continue
+            val = item[key]
+            if isinstance(val, torch.Tensor):
+                if val.ndim == 0:
+                    item[key] = val.unsqueeze(0)
+                elif val.ndim == 1 and val.shape[-1] != 1:
+                    # Batched case: (T,) -> (T, 1)
+                    item[key] = val.unsqueeze(-1)
+            elif isinstance(val, np.ndarray):
+                if val.ndim == 0:
+                    dtype = torch.float32 if np.issubdtype(val.dtype, np.floating) else torch.int64
+                    item[key] = torch.tensor([val.item()], dtype=dtype)
+                elif val.ndim == 1 and val.shape[-1] != 1:
+                    item[key] = torch.from_numpy(val).unsqueeze(-1)
+            elif isinstance(val, (int, float, np.floating, np.integer)) and not isinstance(val, bool):
+                dtype = torch.float32 if isinstance(val, (float, np.floating)) else torch.int64
+                item[key] = torch.tensor([val], dtype=dtype)
+        return item
+
     def _ensure_hf_dataset_loaded(self):
         """Lazy load the HF dataset only when needed for reading."""
         if self._lazy_loading or self.hf_dataset is None:
@@ -1075,6 +1139,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 self._writer_closed_for_reading = True
             self.hf_dataset = self.load_hf_dataset()
             self._lazy_loading = False
+            # Reload timestamp cache for fast lookup
+            self._timestamps = np.array(self.hf_dataset["timestamp"])
 
     def __len__(self):
         return self.num_frames
@@ -1114,6 +1180,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if "subtask_index" in self.features and self.meta.subtasks is not None:
             subtask_idx = item["subtask_index"].item()
             item["subtask"] = self.meta.subtasks.iloc[subtask_idx].name
+
+        # Ensure shape-[1] features stored as scalars in parquet are loaded as lists
+        item = self._ensure_shape1_as_list(item)
 
         return item
 
