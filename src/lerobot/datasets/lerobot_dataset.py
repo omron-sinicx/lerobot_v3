@@ -582,6 +582,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_queue_maxsize: int = 30,
         encoder_threads: int | None = None,
         wanted_features: list[str] | None = None,
+        use_videos: bool = True,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -720,7 +721,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.vcodec = resolve_vcodec(vcodec)
         self._encoder_threads = encoder_threads
         self.wanted_features = wanted_features
-
+        self.use_videos = use_videos
         # Unused attributes
         self.image_writer = None
         self.episode_buffer = None
@@ -1178,7 +1179,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         else:
             video_keys = self.meta.video_keys
 
-        if len(video_keys) > 0:
+        if len(video_keys) > 0 and self.use_videos:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(current_ts, query_indices)
             video_frames = self._query_videos(query_timestamps, ep_idx)
