@@ -52,6 +52,11 @@ class RunningQuantileStats:
             batch: An array where all dimensions except the last are batch dimensions.
         """
         batch = batch.reshape(-1, batch.shape[-1])
+        # Promote integer inputs to float before any squaring. uint8 image pixels
+        # would otherwise overflow in ``batch**2`` (e.g. 255**2 mod 256), yielding
+        # a negative variance that clamps ``std`` to 0 for image features.
+        if not np.issubdtype(batch.dtype, np.floating):
+            batch = batch.astype(np.float64)
         num_elements, vector_length = batch.shape
 
         if self._count == 0:
