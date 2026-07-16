@@ -583,7 +583,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_threads: int | None = None,
         wanted_features: list[str] | None = None,
         use_videos: bool = True,
-        lazy_load: bool = False,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -743,28 +742,21 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self._recorded_frames = self.meta.total_frames
         self._writer_closed_for_reading = False
 
-        # Load actual data. With lazy_load, the parquet load is deferred to
-        # _ensure_hf_dataset_loaded() (i.e. the first actual read) — useful when a
-        # consumer may never read the data at all (e.g. a fully cached
-        # RAMCachedDataset). An episodes subset still loads eagerly because the
-        # absolute->relative index mapping below needs the filtered data.
+        # Load actual data. When the full dataset is used (episodes=None), the
+        # parquet load and timestamp preindexing are deferred to
+        # _ensure_hf_dataset_loaded() (i.e. the first actual read) — a consumer that
+        # hits a prebuilt cache (e.g. comet's RAMCachedDataset) may never need them.
+        # The hub-download fallback is preserved: it runs at first load instead of
+        # at construction. An episodes subset still loads eagerly because the
+        # absolute->relative index mapping below (and a correct __len__) need the
+        # filtered data; force_cache_sync also loads eagerly by definition.
+        self._download_videos = download_videos
         self._absolute_to_relative_idx = None
-        if lazy_load and self.episodes is None and not force_cache_sync:
+        if self.episodes is None and not force_cache_sync:
             self.hf_dataset = None
             self._timestamps = None
         else:
-            try:
-                if force_cache_sync:
-                    raise FileNotFoundError
-                self.hf_dataset = self.load_hf_dataset()
-                # Check if cached dataset contains all requested episodes
-                if not self._check_cached_episodes_sufficient():
-                    raise FileNotFoundError("Cached dataset doesn't contain all requested episodes")
-            except (FileNotFoundError, NotADirectoryError):
-                if is_valid_version(self.revision):
-                    self.revision = get_safe_version(self.repo_id, self.revision)
-                self.download(download_videos)
-                self.hf_dataset = self.load_hf_dataset()
+            self._load_with_download_fallback(force=force_cache_sync)
 
             # Create mapping from absolute indices to relative indices when only a subset of the episodes are loaded
             # Build a mapping: absolute_index -> relative_index_in_filtered_dataset
@@ -1027,7 +1019,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         for key in video_keys:
             if query_indices is not None and key in query_indices:
                 # Use preloaded timestamps when available (avoids hf_dataset access)
-                if hasattr(self, "_timestamps"):
+                if getattr(self, "_timestamps", None) is not None:
                     if self._absolute_to_relative_idx is not None:
                         relative_indices = [
                             self._absolute_to_relative_idx[idx] for idx in query_indices[key]
@@ -1152,6 +1144,23 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 item[key] = torch.tensor([val], dtype=dtype)
         return item
 
+    def _load_with_download_fallback(self, force: bool = False) -> None:
+        """Load the HF dataset from disk, downloading from the hub when the local
+        copy is missing or incomplete (same semantics as the historical eager load
+        in __init__)."""
+        try:
+            if force:
+                raise FileNotFoundError
+            self.hf_dataset = self.load_hf_dataset()
+            # Check if cached dataset contains all requested episodes
+            if not self._check_cached_episodes_sufficient():
+                raise FileNotFoundError("Cached dataset doesn't contain all requested episodes")
+        except (FileNotFoundError, NotADirectoryError):
+            if is_valid_version(self.revision):
+                self.revision = get_safe_version(self.repo_id, self.revision)
+            self.download(self._download_videos)
+            self.hf_dataset = self.load_hf_dataset()
+
     def _ensure_hf_dataset_loaded(self):
         """Lazy load the HF dataset only when needed for reading."""
         if self._lazy_loading or self.hf_dataset is None:
@@ -1159,7 +1168,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
             if self.writer is not None:
                 self._close_writer()
                 self._writer_closed_for_reading = True
-            self.hf_dataset = self.load_hf_dataset()
+            if self.hf_dataset is None and not self._lazy_loading:
+                # Deferred initial load: keep the hub-download fallback. Writer
+                # refreshes (_lazy_loading) reload plainly — a mid-recording
+                # dataset must never try to download itself.
+                self._load_with_download_fallback()
+            else:
+                self.hf_dataset = self.load_hf_dataset()
             self._lazy_loading = False
             # Reload timestamp cache for fast lookup
             self._timestamps = np.array(self.hf_dataset["timestamp"])
