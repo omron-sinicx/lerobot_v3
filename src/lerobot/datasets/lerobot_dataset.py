@@ -583,6 +583,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_threads: int | None = None,
         wanted_features: list[str] | None = None,
         use_videos: bool = True,
+        lazy_load: bool = False,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -742,31 +743,39 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self._recorded_frames = self.meta.total_frames
         self._writer_closed_for_reading = False
 
-        # Load actual data
-        try:
-            if force_cache_sync:
-                raise FileNotFoundError
-            self.hf_dataset = self.load_hf_dataset()
-            # Check if cached dataset contains all requested episodes
-            if not self._check_cached_episodes_sufficient():
-                raise FileNotFoundError("Cached dataset doesn't contain all requested episodes")
-        except (FileNotFoundError, NotADirectoryError):
-            if is_valid_version(self.revision):
-                self.revision = get_safe_version(self.repo_id, self.revision)
-            self.download(download_videos)
-            self.hf_dataset = self.load_hf_dataset()
-
-        # Create mapping from absolute indices to relative indices when only a subset of the episodes are loaded
-        # Build a mapping: absolute_index -> relative_index_in_filtered_dataset
+        # Load actual data. With lazy_load, the parquet load is deferred to
+        # _ensure_hf_dataset_loaded() (i.e. the first actual read) — useful when a
+        # consumer may never read the data at all (e.g. a fully cached
+        # RAMCachedDataset). An episodes subset still loads eagerly because the
+        # absolute->relative index mapping below needs the filtered data.
         self._absolute_to_relative_idx = None
-        if self.episodes is not None:
-            self._absolute_to_relative_idx = {
-                abs_idx.item() if isinstance(abs_idx, torch.Tensor) else abs_idx: rel_idx
-                for rel_idx, abs_idx in enumerate(self.hf_dataset["index"])
-            }
+        if lazy_load and self.episodes is None and not force_cache_sync:
+            self.hf_dataset = None
+            self._timestamps = None
+        else:
+            try:
+                if force_cache_sync:
+                    raise FileNotFoundError
+                self.hf_dataset = self.load_hf_dataset()
+                # Check if cached dataset contains all requested episodes
+                if not self._check_cached_episodes_sufficient():
+                    raise FileNotFoundError("Cached dataset doesn't contain all requested episodes")
+            except (FileNotFoundError, NotADirectoryError):
+                if is_valid_version(self.revision):
+                    self.revision = get_safe_version(self.repo_id, self.revision)
+                self.download(download_videos)
+                self.hf_dataset = self.load_hf_dataset()
 
-        # Preload timestamps for fast lookup (avoids repeated hf_dataset access in _get_query_timestamps)
-        self._timestamps = np.array(self.hf_dataset["timestamp"])
+            # Create mapping from absolute indices to relative indices when only a subset of the episodes are loaded
+            # Build a mapping: absolute_index -> relative_index_in_filtered_dataset
+            if self.episodes is not None:
+                self._absolute_to_relative_idx = {
+                    abs_idx.item() if isinstance(abs_idx, torch.Tensor) else abs_idx: rel_idx
+                    for rel_idx, abs_idx in enumerate(self.hf_dataset["index"])
+                }
+
+            # Preload timestamps for fast lookup (avoids repeated hf_dataset access in _get_query_timestamps)
+            self._timestamps = np.array(self.hf_dataset["timestamp"])
 
         # Setup delta_indices
         if self.delta_timestamps is not None:
