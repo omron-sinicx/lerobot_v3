@@ -583,6 +583,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         encoder_threads: int | None = None,
         wanted_features: list[str] | None = None,
         use_videos: bool = True,
+        lazy_load: bool = True,
+        preindex_timestamps: bool = False,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -742,19 +744,22 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self._recorded_frames = self.meta.total_frames
         self._writer_closed_for_reading = False
 
-        # Load actual data. When the full dataset is used (episodes=None), the
-        # parquet load and timestamp preindexing are deferred to
-        # _ensure_hf_dataset_loaded() (i.e. the first actual read) — a consumer that
-        # hits a prebuilt cache (e.g. comet's RAMCachedDataset) may never need them.
-        # The hub-download fallback is preserved: it runs at first load instead of
-        # at construction. An episodes subset still loads eagerly because the
-        # absolute->relative index mapping below (and a correct __len__) need the
-        # filtered data; force_cache_sync also loads eagerly by definition.
+        # Load actual data (eager by default).
+        # - lazy_load=True defers the parquet load to _ensure_hf_dataset_loaded()
+        #   (i.e. the first actual read) — useful when a consumer may never read the
+        #   data at all (e.g. a fully cached RAMCachedDataset in comet). The
+        #   hub-download fallback then runs at first load instead of at construction.
+        #   An episodes subset always loads eagerly because the absolute->relative
+        #   index mapping below (and a correct __len__) need the filtered data.
+        # - preindex_timestamps=True preloads all timestamps into a numpy array for
+        #   faster _get_query_timestamps lookups; off by default (the fallback
+        #   queries hf_dataset per item).
         self._download_videos = download_videos
+        self._preindex_timestamps = preindex_timestamps
         self._absolute_to_relative_idx = None
-        if self.episodes is None and not force_cache_sync:
+        self._timestamps = None
+        if lazy_load and self.episodes is None and not force_cache_sync:
             self.hf_dataset = None
-            self._timestamps = None
         else:
             self._load_with_download_fallback(force=force_cache_sync)
 
@@ -766,8 +771,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     for rel_idx, abs_idx in enumerate(self.hf_dataset["index"])
                 }
 
-            # Preload timestamps for fast lookup (avoids repeated hf_dataset access in _get_query_timestamps)
-            self._timestamps = np.array(self.hf_dataset["timestamp"])
+            if preindex_timestamps:
+                self._timestamps = np.array(self.hf_dataset["timestamp"])
 
         # Setup delta_indices
         if self.delta_timestamps is not None:
@@ -1158,7 +1163,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         except (FileNotFoundError, NotADirectoryError):
             if is_valid_version(self.revision):
                 self.revision = get_safe_version(self.repo_id, self.revision)
-            self.download(self._download_videos)
+            self.download(getattr(self, "_download_videos", True))
             self.hf_dataset = self.load_hf_dataset()
 
     def _ensure_hf_dataset_loaded(self):
@@ -1169,15 +1174,19 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 self._close_writer()
                 self._writer_closed_for_reading = True
             if self.hf_dataset is None and not self._lazy_loading:
-                # Deferred initial load: keep the hub-download fallback. Writer
-                # refreshes (_lazy_loading) reload plainly — a mid-recording
-                # dataset must never try to download itself.
+                # Deferred initial load (lazy_load=True): keep the hub-download
+                # fallback. Writer refreshes (_lazy_loading) reload plainly — a
+                # mid-recording dataset must never try to download itself.
                 self._load_with_download_fallback()
             else:
                 self.hf_dataset = self.load_hf_dataset()
             self._lazy_loading = False
-            # Reload timestamp cache for fast lookup
-            self._timestamps = np.array(self.hf_dataset["timestamp"])
+            # Rebuild the timestamp cache only when preindexing is enabled
+            # (getattr: instances built via create() bypass __init__)
+            if getattr(self, "_preindex_timestamps", False):
+                self._timestamps = np.array(self.hf_dataset["timestamp"])
+            else:
+                self._timestamps = None
 
     def __len__(self):
         return self.num_frames
