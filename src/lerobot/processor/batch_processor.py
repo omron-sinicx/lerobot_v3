@@ -117,6 +117,12 @@ class AddBatchDimensionObservationStep(ObservationProcessorStep):
         for key, value in observation.items():
             if key.startswith(f"{OBS_IMAGES}.") and isinstance(value, Tensor) and value.dim() == 3:
                 observation[key] = value.unsqueeze(0)
+
+        # Catch-all: add batch dim to any remaining 1D tensor (e.g. observation.bendlabs, observation.ft)
+        for key, value in observation.items():
+            if isinstance(value, Tensor) and value.dim() == 1:
+                observation[key] = value.unsqueeze(0)
+
         return observation
 
     def transform_features(
